@@ -66,25 +66,28 @@
 
 ### Docker
 
-推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` 默认使用本 fork 的 GHCR 镜像：
+推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` **默认本地 build**（`Dockerfile`），不拉取远程镜像：
 
 ```yaml
-image: ${KIRO_RS_IMAGE:-ghcr.io/josephcy95/kiro-rs:latest}
+build:
+  context: .
+  dockerfile: Dockerfile
+image: kiro-rs:local
 ports:
   - "8990:8990"
 volumes:
   - ./data/:/app/config/
 ```
 
-镜像由 GitHub Actions（`.github/workflows/docker-build.yaml`）在 push / tag / 手动触发时多架构构建并推送到 `ghcr.io/josephcy95/kiro-rs`。若包为 private，拉取前需 `docker login ghcr.io`。
+GitHub Actions 仍会把多架构镜像推到 `ghcr.io/josephcy95/kiro-rs`（可选）。若改用预构建镜像，把 `build:` 换成 `image: ghcr.io/josephcy95/kiro-rs:latest` 即可（private 包需先 `docker login ghcr.io`）。
 
-部署：
+部署（需先 clone 本仓库，因默认要本地 build）：
 
 ```bash
-mkdir -p /opt/kiro-rs/data
-cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/josephcy95/kiro.rs/master/docker-compose.yml
-docker compose up -d
+git clone https://github.com/josephcy95/kiro.rs.git
+cd kiro.rs
+mkdir -p data
+docker compose up -d --build
 ```
 
 首次启动时，程序会在挂载目录中自动生成：
