@@ -123,10 +123,12 @@ docker compose logs --tail=200 kiro-rs
 - API: `http://<host>:8990/v1/messages`
 - Admin UI: `http://<host>:8990/admin`
 
-指定镜像版本：
+使用 GHCR 预构建镜像（跳过本地 compile）时，可临时改 `docker-compose.yml` 的 `image:`，或：
 
 ```bash
-KIRO_RS_IMAGE=ghcr.io/josephcy95/kiro-rs:0.7.1 docker compose up -d
+docker compose -f docker-compose.yml up -d
+# 或直接：
+docker pull ghcr.io/josephcy95/kiro-rs:latest
 ```
 
 ### 下载二进制
