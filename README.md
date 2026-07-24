@@ -66,22 +66,24 @@
 
 ### Docker
 
-推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` 默认使用 Docker Hub 镜像：
+推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` 默认使用本 fork 的 GHCR 镜像：
 
 ```yaml
-image: ${KIRO_RS_IMAGE:-zyphrzero/kiro-rs:latest}
+image: ${KIRO_RS_IMAGE:-ghcr.io/josephcy95/kiro-rs:latest}
 ports:
   - "8990:8990"
 volumes:
   - ./data/:/app/config/
 ```
 
+镜像由 GitHub Actions（`.github/workflows/docker-build.yaml`）在 push / tag / 手动触发时多架构构建并推送到 `ghcr.io/josephcy95/kiro-rs`。若包为 private，拉取前需 `docker login ghcr.io`。
+
 部署：
 
 ```bash
 mkdir -p /opt/kiro-rs/data
 cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/josephcy95/kiro.rs/master/docker-compose.yml
 docker compose up -d
 ```
 
@@ -121,7 +123,7 @@ docker compose logs --tail=200 kiro-rs
 指定镜像版本：
 
 ```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.1 docker compose up -d
+KIRO_RS_IMAGE=ghcr.io/josephcy95/kiro-rs:0.7.1 docker compose up -d
 ```
 
 ### 下载二进制
@@ -787,11 +789,11 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 当前稳定版：[v0.7.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.1)。
 
-Docker 镜像：
+Docker 镜像（GHCR）：
 
-- `zyphrzero/kiro-rs:<version>`
-- `zyphrzero/kiro-rs:latest`
-- `zyphrzero/kiro-rs:beta`（master beta 构建）
+- `ghcr.io/josephcy95/kiro-rs:latest`（默认分支）
+- `ghcr.io/josephcy95/kiro-rs:<semver>`（git tag `v*`）
+- `ghcr.io/josephcy95/kiro-rs:sha-<short>` / 分支名 tag
 
 容器内在线更新会下载对应平台二进制并替换当前可执行文件；替换后进程退出，由 Docker `restart: unless-stopped` 拉起新进程。回退依赖本地 `<exe>.backup`。
 
