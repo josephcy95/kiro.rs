@@ -1,5 +1,11 @@
 name: Build and Push GHCR Images
 
+# Faster/leaner than single-runner QEMU multi-arch:
+# - native amd64 + arm64 runners in parallel (no QEMU)
+# - registry cache on GHCR (avoids flaky GHA cache export "not_found")
+# - no provenance/sbom (saves time; images still usable)
+# - per-arch tags + final multi-arch manifest
+
 on:
   push:
     branches:
@@ -20,25 +26,31 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # GHCR requires lowercase image names
   IMAGE_NAME: josephcy95/kiro-rs
 
 jobs:
-  build-and-push:
-    name: Build and push multi-arch image
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            # Native ARM — much faster than QEMU on ubuntu-latest
+            runner: ubuntu-24.04-arm
+            arch: arm64
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,7 +62,51 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata (tags, labels)
+      - name: Docker meta (per-arch)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=build-${{ matrix.arch }}-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=kiro-rs
+            org.opencontainers.image.description=Kiro.rs container image (josephcy95 fork)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and push (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Registry cache on GHCR — more reliable than GHA cache export
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }},mode=max
+          provenance: false
+          sbom: false
+
+  merge:
+    name: Merge multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (final tags)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -62,21 +118,29 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,prefix=sha-
             type=ref,event=branch
-          labels: |
-            org.opencontainers.image.title=kiro-rs
-            org.opencontainers.image.description=Kiro.rs multi-arch container image (josephcy95 fork)
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
+      - name: Create and push multi-arch manifests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          SHA: ${{ github.sha }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          AMD64="${IMAGE}:build-amd64-${SHA}"
+          ARM64="${IMAGE}:build-arm64-${SHA}"
+
+          # Wait briefly for registry consistency
+          for i in 1 2 3 4 5; do
+            docker buildx imagetools inspect "$AMD64" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          for i in 1 2 3 4 5; do
+            docker buildx imagetools inspect "$ARM64" >/dev/null 2>&1 && break
+            sleep 5
+          done
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Creating manifest: $tag"
+            docker buildx imagetools create -t "$tag" "$AMD64" "$ARM64"
+          done <<< "$TAGS"
