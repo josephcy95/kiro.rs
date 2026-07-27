@@ -2,6 +2,7 @@
 export interface CredentialsStatusResponse {
   total: number
   available: number
+  /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
   credentials: CredentialStatusItem[]
 }
@@ -14,6 +15,7 @@ export interface CredentialStatusItem {
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
   totalFailureCount: number
+  /** 是否为优先级模式下的当前优先凭据；均衡模式恒为 false */
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
@@ -62,6 +64,7 @@ export interface BalanceResponse {
 // 某凭据当前可用的模型列表响应
 export interface AvailableModelsResponse {
   id: number
+  selectionMode: 'specified' | 'priority' | 'balanced'
   models: AvailableModelItem[]
 }
 
@@ -71,6 +74,17 @@ export interface AvailableModelItem {
   modelName?: string
   description?: string
   maxInputTokens?: number
+  maxOutputTokens?: number
+}
+
+// 真实模型请求测试结果
+export interface ModelTestResponse {
+  modelId: string
+  credentialId: number
+  latencyMs: number
+  responseText: string
+  creditUsage?: number
+  creditUnit?: string
 }
 
 // 成功响应

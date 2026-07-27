@@ -13,7 +13,7 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
+    /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
@@ -33,7 +33,7 @@ pub struct CredentialStatusItem {
     pub failure_count: u32,
     /// 累计失败次数（所有失败类型，只增不减，仅手动重置归零）
     pub total_failure_count: u64,
-    /// 是否为当前活跃凭据
+    /// 是否为优先级模式下的当前优先凭据；均衡模式固定为 false
     pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
@@ -350,8 +350,19 @@ pub struct BalanceResponse {
 pub struct AvailableModelsResponse {
     /// 凭据 ID
     pub id: u64,
+    /// 本次模型列表使用的凭据选择方式
+    pub selection_mode: ModelSelectionMode,
     /// 该凭据（按订阅等级）当前可用的模型
     pub models: Vec<AvailableModelItem>,
+}
+
+/// 模型列表所用凭据的选择方式。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelSelectionMode {
+    Specified,
+    Priority,
+    Balanced,
 }
 
 /// 单个可用模型
@@ -369,6 +380,30 @@ pub struct AvailableModelItem {
     /// 最大输入 Token 数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<i64>,
+    /// 最大输出 Token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+}
+
+/// 真实模型请求测试参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestRequest {
+    pub model_id: String,
+}
+
+/// 真实模型请求测试结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTestResponse {
+    pub model_id: String,
+    pub credential_id: u64,
+    pub latency_ms: u64,
+    pub response_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_unit: Option<String>,
 }
 
 // ============ 一键超额 ============

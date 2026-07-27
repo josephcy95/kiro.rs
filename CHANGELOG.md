@@ -4,6 +4,61 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] - 2026-07-28
+
+主题：**以 Kiro 上游实际返回的模型目录替代本地静态列表，新增按凭据缓存、分组聚合和模型感知路由，并开放未知合法模型 ID 的直接透传**。本次兼容性补丁同时扩展了 Admin 模型面板：可按账号池策略查询模型、查看输入/输出 Token 上限，并发送真实的最小化请求验证模型。已有 `customModels`、`-thinking` 请求方式和静态上下文估算继续兼容。
+
+### ✨ 新功能 — 动态模型发现与模型感知路由
+
+- **`GET /v1/models` 改为上游动态目录**：按当前客户端 Key 的凭据分组查询可访问账号，合并并去重各账号实际返回的模型；保留上游显示名和输入/输出 Token 上限，自定义模型元数据优先，最终按模型 ID 稳定排序。
+- **逐凭据模型缓存**：新增 `modelCacheTtlSecs` 配置（默认 `3600` 秒），每个凭据独立缓存并使用 singleflight 锁避免并发重复刷新；启动后后台预热。刷新失败时可继续使用最后一次成功结果，部分凭据失败不会丢弃其它凭据已经取得的模型。
+- **缓存随凭据状态失效**：编辑代理、刷新或替换凭据、删除凭据以及整体重载时会清理对应缓存，避免模型目录与实际账号配置脱节。
+- **路由优先选择已确认支持模型的凭据**：账号缓存明确包含目标模型时优先使用，明确不包含时跳过；尚无缓存的账号仍可尝试，确保上游模型列表临时不可用时不会退化成本地硬白名单。该规则同时适用于 `priority` 和 `balanced` 模式，并保持客户端 Key 分组隔离。
+
+### ✨ 增强 — 开放模型 ID 透传
+
+- **未知模型不再被静态映射表拦截**：`customModels` 显式别名仍具有最高优先级；常见 Claude 日期后缀、`latest`、`-thinking`、点号/连字符版本和旧式命名会先规范化，其余非空且格式合法的 ID（如 `glm-5`、`minimax-m2.5`、`deepseek-3.2`）原样下发给 Kiro，由上游决定可用性。
+- **未来 Claude 型号兼容**：Claude 模型规范化不再局限于当前硬编码版本，新增型号和常见别名可复用现有请求路径；未知动态模型不会盲目附加尚未确认支持的 `output_config`。
+- **请求默认值与校验补齐**：Anthropic 请求缺省 `max_tokens` 时使用 `32000`，显式传入 `0` 或负数会返回参数错误；动态目录未提供输出上限时同样展示 `32000`，GPT-5.6 和自定义模型的既有上限仍保留。
+
+### ✨ 新功能 — Admin 模型查询与真实请求测试
+
+- **账号池模型查询**：新增 `GET /api/admin/models`，按正常账号池策略选择凭据并返回 `specified` / `priority` / `balanced` 选择方式；原单凭据模型接口也返回选择方式和 `maxOutputTokens`。
+- **真实模型验证**：新增 `POST /api/admin/models/test`，使用所选凭据向指定模型发送最小化请求，返回响应文本、凭据 ID、耗时及可用的 credit 计费信息，便于区分“目录可见”和“实际可调用”。
+- **管理端模型面板升级**：支持当前账号池与指定凭据两种查看方式，展示模型 ID、名称和输入/输出 Token 上限，并可直接触发真实请求测试；刷新模型不会修改账号池的调度指针。
+
+### 🔧 修复 — 负载模式状态语义
+
+- **均衡模式不再伪造当前账号**：`balanced` 模式下状态接口的 `currentId` 固定为 `0`，所有凭据的 `isCurrent` 固定为 `false`；`priority` 模式继续准确展示当前优先凭据。
+- **只读查询不扰动调度**：模型目录查询所需的账号选择不会增加成功计数或改写均衡调度状态；从均衡模式切回优先级模式时会重新选择最高优先级的可用凭据。真实模型测试仍走正常请求链路并反映实际账号状态。
+- **不再发布合成的 thinking 别名**：动态模型列表只展示上游真实模型与显式自定义模型，不额外生成 `-thinking` 条目；请求中使用 `-thinking` 后缀自动启用 Thinking 的兼容行为保持不变。
+
+### 🧪 测试
+
+- 新增动态目录聚合、Token 上限、自定义模型覆盖、开放透传与非法 ID、`max_tokens` 校验、逐凭据缓存 TTL / singleflight / 失效、陈旧缓存降级、分组隔离、模型感知路由，以及 priority / balanced 状态切换和只读选择等回归测试。
+
+## [0.7.2] - 2026-07-26
+
+主题：**新增 `config.json` 配置驱动的自定义模型映射，并把上游 meteringEvent 的 credit 计费字段透传到 Anthropic / OpenAI 响应的 usage 对象**。本次为兼容性补丁版本：自定义模型默认空数组、完全向后兼容，credit 字段仅在收到 meteringEvent 时才追加，不影响任何既有响应结构。
+
+### ✨ 新功能 — 自定义模型支持
+
+> 来源：[PR #46](https://github.com/ZyphrZero/kiro.rs/pull/46)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **`config.json` 新增 `customModels` 数组**：把任意客户端模型别名映射到 Kiro 后端模型 ID，并可声明 `displayName` / `contextWindow` / `maxTokens` / `supportsReasoning` / `ownedBy`。自定义条目按 `id`（大小写不敏感）精确匹配，**优先于**内置关键词模糊映射——既能新增模型，也能覆盖内置模型的后端指向。
+- **thinking 后缀回退**：客户端传 `<alias>-thinking` 而无同名精确条目时，自动剥离后缀回退到 `<alias>`，与内置映射对 thinking 变体的处理一致。
+- **`GET /v1/models` 展示**：所有自定义模型追加到列表尾部（保持配置顺序）。
+- **上下文窗口 / reasoning**：设了 `contextWindow` 时以其为准；`supportsReasoning: true` 让对应 backend_id 放行 `additionalModelRequestFields`。
+- **零透传实现**：复用项目既有的 `OnceLock` 全局配置惯例（同 `token.rs`），启动时装载一次只读注册表，`map_model` / `get_context_window_size` / `available_models` 内部查表，未改动任何函数签名。`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。默认空数组，向后兼容。
+
+### ✨ 新功能 — meteringEvent credit 字段透传
+
+> 来源：[PR #47](https://github.com/ZyphrZero/kiro.rs/pull/47)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- **usage 携带 credit 计费元数据**：把上游 meteringEvent 的 `usage` / `unit` / `unitPlural` 透传到 Anthropic 与 OpenAI 响应的 usage 对象（`credit_usage` / `credit_unit` / `credit_unit_plural`），让客户端拿到与 Kiro 后端一致的计费口径——与 kiro-rs 行为对齐。
+- **四条出口一并接线**：非流式 handler、流式 stream、OpenAI（chat completions）与 websearch_loop 均注入；字段仅在确实收到 meteringEvent 时才追加，未下发时 usage 结构保持原样，不影响既有客户端解析。
+- **metering 解析字段补齐**：`MeteringEvent` 新增 `unit` / `unit_plural` 持久化字段（默认空串），解析失败仍由 ParseError 上抛，新增空载荷默认值测试覆盖。
+
 ## [0.7.1] - 2026-07-15
 
 主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。

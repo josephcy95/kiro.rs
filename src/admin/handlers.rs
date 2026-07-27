@@ -21,8 +21,8 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
-        CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
+        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
+        CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -152,6 +152,27 @@ pub async fn get_credential_models(
     match state.service.get_available_models(id).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
+    }
+}
+
+/// GET /api/admin/models
+/// 使用账号池当前选中的可用凭据实时查询上游模型列表。
+pub async fn get_current_models(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_current_available_models().await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
+    }
+}
+
+/// POST /api/admin/models/test
+/// 使用所选模型发送真实的最小化 Kiro 请求。
+pub async fn test_model(
+    State(state): State<AdminState>,
+    Json(request): Json<ModelTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_model(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
     }
 }
 
@@ -927,13 +948,18 @@ pub async fn update_client_key(
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
-    let group = payload
-        .group
-        .map(|g| {
-            let t = g.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
-        });
-    if state.client_keys.update_meta(id, payload.name, description, group) {
+    let group = payload.group.map(|g| {
+        let t = g.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    });
+    if state
+        .client_keys
+        .update_meta(id, payload.name, description, group)
+    {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (
@@ -1167,7 +1193,9 @@ pub async fn stats_timeseries(
     };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let points = state.usage_aggregator.query_timeseries(window, key_id, cred_ids.as_ref());
+    let points = state
+        .usage_aggregator
+        .query_timeseries(window, key_id, cred_ids.as_ref());
     Json(points).into_response()
 }
 
@@ -1210,7 +1238,9 @@ pub async fn stats_by_credential(
             .map(|c| c.id)
             .collect()
     });
-    let data = state.usage_aggregator.query_by_credential(window, key_id, cred_ids.as_ref());
+    let data = state
+        .usage_aggregator
+        .query_by_credential(window, key_id, cred_ids.as_ref());
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1237,7 +1267,10 @@ pub async fn list_traces(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
-    let group = params.get("group").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let group = params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
         state
             .service
@@ -1375,10 +1408,7 @@ pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoRe
 
 // ============ 账号分组（独立实体）============
 
-fn group_to_item(
-    g: &super::groups::Group,
-    state: &AdminState,
-) -> super::types::GroupItem {
+fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::GroupItem {
     super::types::GroupItem {
         name: g.name.clone(),
         description: g.description.clone(),
@@ -1407,10 +1437,7 @@ pub async fn create_group(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::CreateGroupRequest>,
 ) -> impl IntoResponse {
-    match state
-        .groups
-        .create(payload.name, payload.description)
-    {
+    match state.groups.create(payload.name, payload.description) {
         Ok(g) => Json(group_to_item(&g, &state)).into_response(),
         Err(e) => {
             let msg = e.to_string();
@@ -1503,7 +1530,9 @@ pub async fn update_group(
         if let Err(e) = state.groups.update_description(&current_name, desc_opt) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    e.to_string(),
+                )),
             )
                 .into_response();
         }
@@ -1561,11 +1590,7 @@ pub async fn delete_group(
     }
 
     if query.force {
-        if let Err(e) = state
-            .service
-            .token_manager()
-            .remove_credential_group(&name)
-        {
+        if let Err(e) = state.service.token_manager().remove_credential_group(&name) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(super::types::AdminErrorResponse::internal_error(format!(

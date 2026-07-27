@@ -321,6 +321,8 @@ codex
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
+| `/api/admin/models` | 使用账号池当前选中的可用凭据实时查询模型 |
+| `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
@@ -371,6 +373,7 @@ Admin API 鉴权同样支持：
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
@@ -515,47 +518,50 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 <a id="models"></a>
 ## 模型
 
-`GET /v1/models` 返回本服务声明支持的模型 ID。真实可用性仍取决于上游账号订阅；Admin 的“凭据模型”会查询该凭据的上游真实可用模型列表。
+`GET /v1/models` 会查询当前客户端 Key 所属分组可访问的凭据，返回这些凭据上游模型列表的去重并集，不额外生成 `-thinking` 模型。列表按凭据缓存，默认 TTL 为一小时；刷新部分失败时继续使用最后一次成功缓存。为兼容已有客户端，请求中仍可使用 `-thinking` 后缀自动开启 Thinking。
 
-当前静态列表包含：
+请求模型按以下顺序解析：
 
-- `gpt-5.6-sol`
-- `gpt-5.6-terra`
-- `gpt-5.6-luna`
-- `claude-fable-5` / `claude-fable-5-thinking`
-- `claude-sonnet-5` / `claude-sonnet-5-thinking`
-- `claude-opus-4-8` / `claude-opus-4-8-thinking`
-- `claude-sonnet-4-8` / `claude-sonnet-4-8-thinking`
-- `claude-opus-4-7` / `claude-opus-4-7-thinking`
-- `claude-opus-4-6` / `claude-opus-4-6-thinking`
-- `claude-sonnet-4-6` / `claude-sonnet-4-6-thinking`
-- `claude-opus-4-5-20251101` / `claude-opus-4-5-20251101-thinking`
-- `claude-sonnet-4-5-20250929` / `claude-sonnet-4-5-20250929-thinking`
-- `claude-haiku-4-5-20251001` / `claude-haiku-4-5-20251001-thinking`
+1. 优先匹配 `customModels` 中的显式别名。
+2. 规范化常见 Claude ID，包括日期后缀、`latest`、`-thinking`、点号/连字符版本和旧式 `claude-3-5-sonnet` 顺序。
+3. 其余非空合法模型 ID 原样发给 Kiro，例如 `glm-5`、`minimax-m2.5`、`deepseek-3.2`。最终可用性由上游判断。
 
-模型映射按关键词归一化到 Kiro 内部模型 ID：
-
-| 请求模型关键词 | 上游模型 |
-|---|---|
-| 以 `gpt-5` 开头 | 原样透传，例如 `gpt-5.6-sol` |
-| `fable`（任意） | `claude-fable-5` |
-| `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5` |
-| `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
-| `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
-| `sonnet` + `4-5` / `4.5` | `claude-sonnet-4.5` |
-| `opus` + `4-8` / `4.8` | `claude-opus-4.8` |
-| `opus` + `4-7` / `4.7` | `claude-opus-4.7` |
-| `opus` + `4-6` / `4.6` | `claude-opus-4.6` |
-| `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
-| 任意 `haiku` | `claude-haiku-4.5` |
-
-没有命中上述规则的模型会作为不支持模型处理。
+动态模型缓存也用于凭据路由：已确认包含目标模型的凭据优先，已加载缓存且明确不包含目标模型的凭据会跳过；尚未加载缓存的凭据仍允许尝试，因此模型列表接口暂时不可用不会形成新的本地白名单。
 
 上下文窗口估算：
 
 - `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
+
+### 自定义模型
+
+可在 `config.json` 增加 `customModels` 数组，把任意客户端模型别名映射到 Kiro 后端模型 ID。自定义条目**优先于**内置 Claude 格式规范化和开放透传，既能新增模型，也能覆盖模型的后端指向。
+
+```jsonc
+{
+  "customModels": [
+    {
+      "id": "my-opus",                 // 客户端请求用的模型名（大小写不敏感精确匹配）
+      "backendId": "claude-opus-4.8",  // 实际下发给 Kiro 的后端模型 ID（必填）
+      "displayName": "My Opus",        // 可选，/v1/models 展示名，缺省用 id
+      "contextWindow": 1000000,         // 可选，上下文窗口，缺省 200000
+      "maxTokens": 64000,               // 可选，/v1/models 展示的最大输出，缺省 64000
+      "supportsReasoning": true,        // 可选，是否放行原生 reasoning，缺省 false
+      "ownedBy": "custom"               // 可选，/v1/models 的 owned_by，缺省 "custom"
+    }
+  ]
+}
+```
+
+行为说明：
+
+- **匹配**：按 `id` 大小写不敏感精确匹配；客户端传 `my-opus-thinking` 时，若无同名精确条目，会自动剥离 `-thinking` 后缀回退到 `my-opus`。
+- **优先级**：命中自定义表直接返回其 `backendId`，不再走内置关键词映射，因此可用同名 `id` 覆盖内置模型的后端指向。
+- **展示**：所有 `customModels` 条目会合并到 `GET /v1/models`，同名时自定义展示名、所有者和最大输出 token 元数据优先；最终列表按模型 ID 稳定排序。
+- **上下文窗口**：设了 `contextWindow` 时以其为准，否则回退到内置估算。
+- **reasoning**：`supportsReasoning: true` 会让该 `backendId` 放行 `additionalModelRequestFields`（`output_config` 等）；后端不接受时上游会返回 400，此时置 false 即可。
+- **兼容性**：默认空数组，现有配置无需迁移；`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。
 
 <a id="thinking-tools-websearch"></a>
 ## Thinking、工具与 WebSearch
@@ -792,7 +798,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.1)。
+当前稳定版：[v0.7.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.3)。
 
 Docker 镜像（GHCR）：
 
