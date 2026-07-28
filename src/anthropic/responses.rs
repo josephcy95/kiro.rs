@@ -49,6 +49,7 @@ use super::middleware::{AppState, KeyContext};
 use super::openai::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
 };
+use super::response_store::{MAX_HISTORY_DEPTH, ResponseStore, StoredResponse};
 use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
@@ -126,6 +127,22 @@ pub struct ResponsesRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
+    /// 引用上一轮 response id，由服务端补齐历史（见 [`super::response_store`]）
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+    /// 是否持久化本轮以供后续 `previous_response_id` 引用；OpenAI 默认 true
+    #[serde(default)]
+    pub store: Option<bool>,
+    /// 客户端自带的键值标注，随快照一并保留并在响应里回显
+    #[serde(default)]
+    pub metadata: Option<BTreeMap<String, String>>,
+}
+
+impl ResponsesRequest {
+    /// `store` 缺省视为 true（与 OpenAI Responses 语义一致）
+    fn should_store(&self) -> bool {
+        self.store.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,16 +165,49 @@ pub async fn post_responses(
     tracing::info!(
         model = %model,
         stream = %want_stream,
+        previous_response_id = ?req.previous_response_id,
         "Received POST /v1/responses request"
     );
 
+    // 0. previous_response_id：沿会话链回溯，展开成本轮之前的历史消息。
+    //    store 未启用时按未找到处理（与 OpenAI 一致：引用不存在的 id 报 400）。
+    let mut history: Vec<HistoryTurn> = Vec::new();
+    if let Some(prev_id) = req.previous_response_id.as_deref() {
+        match state.response_store.as_deref() {
+            Some(store) => match load_history_chain(store, key_ctx.key_id, prev_id) {
+                Ok(turns) => history = turns,
+                Err(msg) => {
+                    return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
+                }
+            },
+            None => {
+                return responses_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "previous_response_id is not supported: response store is unavailable",
+                );
+            }
+        }
+    }
+
+    // 本轮快照要保留原始 input / instructions / metadata，先留副本再消费 req。
+    let should_store = req.should_store();
+    let stored_input = req.input.clone();
+    let stored_instructions = req.instructions.clone();
+    let metadata = req.metadata.clone();
+    let previous_response_id = req.previous_response_id.clone();
+
     // 1. Responses -> Anthropic 请求翻译（同时得到工具声明类型表）
-    let (anthropic_req, tool_kinds) = match responses_to_anthropic(req) {
+    let (anthropic_req, tool_kinds) = match responses_to_anthropic(req, &history) {
         Ok(r) => r,
         Err(msg) => {
             return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
         }
     };
+
+    // post_messages 会消费 state / key_ctx，落盘要用的部分先取出来。
+    let store = state.response_store.clone();
+    let key_id = key_ctx.key_id;
 
     // 2. 复用 Anthropic 全链路（内部强制非流式）
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
@@ -196,9 +246,38 @@ pub async fn post_responses(
 
     // 3. Anthropic -> Responses 响应翻译
     let parsed = parse_anthropic_message(&anthropic, &model);
+    let view = build_view(&parsed, &tool_kinds);
+
+    // 流式与非流式共用同一个 id，保证客户端拿到的 id 与落盘快照一致。
+    let resp_id = new_resp_id();
+
+    // 4. 持久化本轮，供后续 previous_response_id 引用
+    if should_store {
+        if let Some(store) = store.as_deref() {
+            store.save(&StoredResponse {
+                id: resp_id.clone(),
+                key_id,
+                model: parsed.model.clone(),
+                output: view.output.clone(),
+                previous_response_id: previous_response_id.clone(),
+                instructions: stored_instructions,
+                input: Some(stored_input),
+                stored_at: 0,
+            });
+        }
+    }
+
+    let mut body = build_response_object_from(&parsed, &view, &resp_id);
+    if let Some(prev) = previous_response_id {
+        body["previous_response_id"] = json!(prev);
+    }
+    if let Some(meta) = metadata {
+        body["metadata"] = json!(meta);
+    }
+    body["store"] = json!(should_store);
 
     if want_stream {
-        let sse = build_responses_sse(&parsed, &tool_kinds);
+        let sse = build_responses_sse(&parsed, &view, &body);
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -206,15 +285,81 @@ pub async fn post_responses(
             .body(Body::from(sse))
             .unwrap()
     } else {
-        let body = build_responses_object(&parsed, &tool_kinds);
         (StatusCode::OK, Json(body)).into_response()
     }
+}
+
+// ============================ 会话历史 ============================
+
+/// 一轮已持久化的历史（回放时按 Responses item 语义翻译）
+#[derive(Debug)]
+struct HistoryTurn {
+    instructions: Option<String>,
+    input: Option<Value>,
+    output: Vec<Value>,
+}
+
+/// 沿 `previous_response_id` 回溯整条链，返回 oldest → newest 的历史。
+///
+/// 深度上限 [`MAX_HISTORY_DEPTH`] + 已访问集合双重保护：坏链或环不会无限展开。
+/// 链中断（某个祖先过期被清理）时只保留能读到的后半段，不报错——历史不完整
+/// 好过整轮失败。只有链头（客户端直接引用的 id）读不到才报 400。
+fn load_history_chain(
+    store: &ResponseStore,
+    key_id: u64,
+    head_id: &str,
+) -> Result<Vec<HistoryTurn>, String> {
+    let head = store
+        .load(key_id, head_id)
+        .map_err(|e| format!("previous_response_id `{head_id}` not found or expired: {e}"))?;
+
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(head.id.clone());
+    let mut cursor = head.previous_response_id.clone();
+    chain.push(head);
+
+    for _ in 0..MAX_HISTORY_DEPTH {
+        let Some(prev_id) = cursor else { break };
+        if !visited.insert(prev_id.clone()) {
+            tracing::warn!(
+                response_id = %prev_id,
+                "responses: previous_response_id 链存在环，停止回溯"
+            );
+            break;
+        }
+        match store.load(key_id, &prev_id) {
+            Ok(ancestor) => {
+                cursor = ancestor.previous_response_id.clone();
+                chain.push(ancestor);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    response_id = %prev_id,
+                    "responses: 会话链在此中断，仅回放可读部分: {}",
+                    e
+                );
+                break;
+            }
+        }
+    }
+
+    chain.reverse(); // oldest first
+    Ok(chain
+        .into_iter()
+        .map(|turn| HistoryTurn {
+            instructions: turn.instructions,
+            input: turn.input,
+            output: turn.output,
+        })
+        .collect())
 }
 
 // ============================ 请求翻译 ============================
 
 fn responses_to_anthropic(
     req: ResponsesRequest,
+    history: &[HistoryTurn],
 ) -> Result<(MessagesRequest, ToolKindMap), String> {
     let max_tokens = req
         .max_output_tokens
@@ -222,6 +367,31 @@ fn responses_to_anthropic(
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut system: Vec<SystemMessage> = Vec::new();
+    let mut merged: Vec<(String, Vec<Value>)> = Vec::new();
+    // codex 0.144 把工具声明放进 input 里的 `additional_tools` item
+    //（顶层 `tools` 通常为空）；两处都收集，合并转换。
+    let mut declared_entries: Vec<Value> = req.tools.clone().unwrap_or_default();
+
+    // 先铺历史轮（oldest → newest）：每轮的 instructions / input / output 都按
+    // 进方向的 item 语义翻译，assistant 的 tool_use 与随后的 tool_result 因此
+    // 自然保持配对。历史里的工具声明不再重复收集（本轮 tools 才是权威）。
+    for turn in history {
+        if let Some(instr) = turn.instructions.as_deref() {
+            if !instr.trim().is_empty() {
+                system.push(SystemMessage {
+                    text: instr.to_string(),
+                    cache_control: None,
+                });
+            }
+        }
+        if let Some(input) = turn.input.as_ref() {
+            walk_input(input, &mut system, &mut merged, None);
+        }
+        for item in &turn.output {
+            translate_input_item(item, &mut system, &mut merged);
+        }
+    }
+
     if let Some(instr) = req.instructions.as_ref() {
         if !instr.trim().is_empty() {
             system.push(SystemMessage {
@@ -231,37 +401,12 @@ fn responses_to_anthropic(
         }
     }
 
-    let mut merged: Vec<(String, Vec<Value>)> = Vec::new();
-    // codex 0.144 把工具声明放进 input 里的 `additional_tools` item
-    //（顶层 `tools` 通常为空）；两处都收集，合并转换。
-    let mut declared_entries: Vec<Value> = req.tools.clone().unwrap_or_default();
-
-    match &req.input {
-        // input 直接是字符串 → 单条 user 文本
-        Value::String(s) => {
-            if !s.is_empty() {
-                push_merged(&mut merged, "user", vec![json!({"type":"text","text":s})]);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                let item_type = item.get("type").and_then(|v| v.as_str());
-
-                // additional_tools item：真正的工具声明清单（codex 0.144）。
-                // developer 角色的 message item（AGENTS.md / user_instructions /
-                // environment_context）会在 translate_input_item 里归入 system。
-                if item_type == Some("additional_tools") {
-                    if let Some(list) = item.get("tools").and_then(|v| v.as_array()) {
-                        declared_entries.extend(list.iter().cloned());
-                    }
-                    continue;
-                }
-
-                translate_input_item(item, &mut system, &mut merged);
-            }
-        }
-        _ => {}
-    }
+    walk_input(
+        &req.input,
+        &mut system,
+        &mut merged,
+        Some(&mut declared_entries),
+    );
 
     let messages: Vec<Message> = merged
         .into_iter()
@@ -337,7 +482,11 @@ fn responses_to_anthropic(
             max_tokens,
             messages,
             stream: false,
-            system: if system.is_empty() { None } else { Some(system) },
+            system: if system.is_empty() {
+                None
+            } else {
+                Some(system)
+            },
             tools,
             tool_choice,
             thinking: None,
@@ -346,6 +495,46 @@ fn responses_to_anthropic(
         },
         tool_kinds,
     ))
+}
+
+/// 遍历一个 Responses `input`（字符串或 item 数组），翻译进 system / merged。
+///
+/// `declared_entries` 为 `Some` 时额外收集 `additional_tools` item 里的工具声明
+/// （仅本轮需要；回放历史时传 `None`，历史的工具声明不参与本轮）。
+fn walk_input(
+    input: &Value,
+    system: &mut Vec<SystemMessage>,
+    merged: &mut Vec<(String, Vec<Value>)>,
+    mut declared_entries: Option<&mut Vec<Value>>,
+) {
+    match input {
+        // input 直接是字符串 → 单条 user 文本
+        Value::String(s) => {
+            if !s.is_empty() {
+                push_merged(merged, "user", vec![json!({"type":"text","text":s})]);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let item_type = item.get("type").and_then(|v| v.as_str());
+
+                // additional_tools item：真正的工具声明清单（codex 0.144）。
+                // developer 角色的 message item（AGENTS.md / user_instructions /
+                // environment_context）会在 translate_input_item 里归入 system。
+                if item_type == Some("additional_tools") {
+                    if let Some(sink) = declared_entries.as_deref_mut() {
+                        if let Some(list) = item.get("tools").and_then(|v| v.as_array()) {
+                            sink.extend(list.iter().cloned());
+                        }
+                    }
+                    continue;
+                }
+
+                translate_input_item(item, system, merged);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 原生 web_search 工具（kiro-rs 内部代答，最多 5 轮）
@@ -902,6 +1091,7 @@ fn build_response_object_from(p: &ParsedResponse, view: &ResponsesView, id: &str
     obj
 }
 
+#[cfg(test)]
 fn build_responses_object(p: &ParsedResponse, kinds: &ToolKindMap) -> Value {
     let view = build_view(p, kinds);
     let id = new_resp_id();
@@ -913,9 +1103,12 @@ fn build_responses_object(p: &ParsedResponse, kinds: &ToolKindMap) -> Value {
 /// codex 只从 `response.output_item.done` 构建回合内容（`.added` 用于进度
 /// 展示，`response.completed` 只取 id/usage），所以每个 item 只要保证
 /// added/done 成对且 done 携带完整内容即可。delta 事件是锦上添花。
-fn build_responses_sse(p: &ParsedResponse, kinds: &ToolKindMap) -> String {
-    let view = build_view(p, kinds);
-    let resp_id = new_resp_id();
+fn build_responses_sse(p: &ParsedResponse, view: &ResponsesView, final_obj: &Value) -> String {
+    let resp_id = final_obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let mut out = String::new();
     let mut seq: i64 = 0;
 
@@ -1136,13 +1329,16 @@ fn build_responses_sse(p: &ParsedResponse, kinds: &ToolKindMap) -> String {
     }
 
     // response.completed（完整对象含 usage）
-    let final_obj = build_response_object_from(p, &view, &resp_id);
     let completed_event = if view.status == "incomplete" {
         "response.incomplete"
     } else {
         "response.completed"
     };
-    emit(completed_event, json!({ "response": final_obj }), &mut seq);
+    emit(
+        completed_event,
+        json!({ "response": final_obj.clone() }),
+        &mut seq,
+    );
 
     out
 }
@@ -1174,6 +1370,19 @@ mod tests {
 
     fn simple_input() -> Value {
         json!([{ "type": "message", "role": "user", "content": "hi" }])
+    }
+
+    /// 无历史（单轮）的请求翻译，覆盖绝大多数用例
+    fn convert(req: ResponsesRequest) -> Result<(MessagesRequest, ToolKindMap), String> {
+        responses_to_anthropic(req, &[])
+    }
+
+    /// 按 handler 的真实顺序合成 SSE（view + 最终对象共用同一个 id）
+    fn sse_of(p: &ParsedResponse, kinds: &ToolKindMap) -> String {
+        let view = build_view(p, kinds);
+        let id = new_resp_id();
+        let final_obj = build_response_object_from(p, &view, &id);
+        build_responses_sse(p, &view, &final_obj)
     }
 
     fn parsed_with_tool_calls(tool_calls: Vec<Value>) -> ParsedResponse {
@@ -1230,9 +1439,15 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
-        assert_eq!(kinds.get("exec").map(|d| d.kind), Some(DeclaredToolKind::Custom));
-        assert_eq!(kinds.get("wait").map(|d| d.kind), Some(DeclaredToolKind::Function));
+        let (anth, kinds) = convert(req).unwrap();
+        assert_eq!(
+            kinds.get("exec").map(|d| d.kind),
+            Some(DeclaredToolKind::Custom)
+        );
+        assert_eq!(
+            kinds.get("wait").map(|d| d.kind),
+            Some(DeclaredToolKind::Function)
+        );
         let tools = anth.tools.as_ref().unwrap();
         assert!(tools.iter().any(|t| t.name == "exec"));
         assert!(tools.iter().any(|t| t.name == "wait"));
@@ -1256,8 +1471,10 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
-        let decl = kinds.get("collaboration__spawn_agent").expect("flattened name");
+        let (anth, kinds) = convert(req).unwrap();
+        let decl = kinds
+            .get("collaboration__spawn_agent")
+            .expect("flattened name");
         assert_eq!(decl.kind, DeclaredToolKind::Function);
         assert_eq!(decl.name, "spawn_agent");
         assert_eq!(decl.namespace.as_deref(), Some("collaboration"));
@@ -1295,7 +1512,7 @@ mod tests {
                 { "type": "function_call_output", "call_id": "c9", "output": "spawned" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         let tu = &anth.messages[1].content.as_array().unwrap()[0];
         assert_eq!(tu["type"], "tool_use");
         assert_eq!(
@@ -1315,7 +1532,7 @@ mod tests {
             }]),
             simple_input(),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = convert(req).unwrap();
         assert_eq!(
             kinds.get("apply_patch").map(|d| d.kind),
             Some(DeclaredToolKind::Custom)
@@ -1332,8 +1549,9 @@ mod tests {
         assert!(ap.description.contains("lark grammar"));
         assert!(ap.description.contains("start: PATCH"));
         // 原生 web_search 注入，noop 不再存在
-        assert!(tools.iter().any(|t| t.name == "web_search"
-            && t.tool_type.as_deref() == Some("web_search_20250305")));
+        assert!(tools.iter().any(
+            |t| t.name == "web_search" && t.tool_type.as_deref() == Some("web_search_20250305")
+        ));
         assert!(!tools.iter().any(|t| t.name == "noop"));
     }
 
@@ -1352,7 +1570,7 @@ mod tests {
             }]),
             simple_input(),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = convert(req).unwrap();
         assert_eq!(
             kinds.get("shell").map(|d| d.kind),
             Some(DeclaredToolKind::Function)
@@ -1373,7 +1591,7 @@ mod tests {
     #[test]
     fn noop_fallback_when_no_codex_tools() {
         let req = req_with(json!([]), simple_input());
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = convert(req).unwrap();
         assert!(kinds.is_empty());
         let tools = anth.tools.as_ref().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -1381,8 +1599,7 @@ mod tests {
         // 严格提示保留
         let sys = system_texts(&anth);
         assert!(
-            sys.iter()
-                .any(|t| t.contains("Do not call any other tool")),
+            sys.iter().any(|t| t.contains("Do not call any other tool")),
             "strict nudge must be kept for tool-less flows"
         );
     }
@@ -1393,7 +1610,7 @@ mod tests {
             json!([{ "type": "function", "name": "shell", "parameters": {} }]),
             simple_input(),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         let sys = system_texts(&anth);
         assert!(
             !sys.iter().any(|t| t.contains("Do not call any other tool")),
@@ -1412,7 +1629,7 @@ mod tests {
             json!([{ "type": "function", "name": "web_search", "parameters": {} }]),
             simple_input(),
         );
-        let (anth, kinds) = responses_to_anthropic(req).unwrap();
+        let (anth, kinds) = convert(req).unwrap();
         assert_eq!(
             kinds.get("web_search").map(|d| d.kind),
             Some(DeclaredToolKind::Function)
@@ -1435,7 +1652,7 @@ mod tests {
             ]),
             simple_input(),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         let tools = anth.tools.unwrap();
         let ws: Vec<&Tool> = tools.iter().filter(|t| t.name == "web_search").collect();
         assert_eq!(ws.len(), 1);
@@ -1455,7 +1672,7 @@ mod tests {
                 { "type": "custom_tool_call_output", "call_id": "c1", "output": "Done!" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         assert_eq!(anth.messages.len(), 3);
 
         let assistant = &anth.messages[1];
@@ -1490,7 +1707,7 @@ mod tests {
                   ] },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         let tr = &anth.messages[2].content.as_array().unwrap()[0];
         assert_eq!(tr["content"], "line1\nline2");
     }
@@ -1505,7 +1722,7 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         let sys = system_texts(&anth);
         assert!(
             sys.iter().any(|t| t.contains("AGENTS.md rules here")),
@@ -1527,7 +1744,7 @@ mod tests {
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req).unwrap();
+        let (anth, _) = convert(req).unwrap();
         assert_eq!(anth.messages.len(), 1);
         assert_eq!(anth.messages[0].role, "user");
     }
@@ -1537,7 +1754,10 @@ mod tests {
     #[test]
     fn custom_input_unwrap_fallbacks() {
         // 标准：{"input": "..."}
-        assert_eq!(custom_input_text(r#"{"input":"*** Begin Patch"}"#), "*** Begin Patch");
+        assert_eq!(
+            custom_input_text(r#"{"input":"*** Begin Patch"}"#),
+            "*** Begin Patch"
+        );
         // 单字段字符串对象
         assert_eq!(custom_input_text(r#"{"cmd":"echo hi"}"#), "echo hi");
         // 多字段对象 → 原样
@@ -1637,7 +1857,7 @@ mod tests {
             "id": "toolu_1", "type": "function",
             "function": { "name": "apply_patch", "arguments": "{\"input\":\"PATCH BODY\"}" },
         })]);
-        let sse = build_responses_sse(&p, &kinds);
+        let sse = sse_of(&p, &kinds);
         assert!(sse.contains("event: response.output_item.added"));
         assert!(sse.contains("event: response.output_item.done"));
         assert!(sse.contains("event: response.custom_tool_call_input.delta"));
@@ -1658,18 +1878,22 @@ mod tests {
         );
         let input_done_line = sse
             .lines()
-            .find(|l| {
-                l.starts_with("data: ")
-                    && l.contains("response.custom_tool_call_input.done")
-            })
+            .find(|l| l.starts_with("data: ") && l.contains("response.custom_tool_call_input.done"))
             .expect("custom input done event data line");
         assert!(input_done_line.contains("\"input\":\"PATCH BODY\""));
         // added 也必须带完整 input（codex 反序列化要求字段存在）
         let added_line = sse
             .lines()
-            .find(|l| l.starts_with("data: ") && l.contains("custom_tool_call") && l.contains("in_progress"))
+            .find(|l| {
+                l.starts_with("data: ")
+                    && l.contains("custom_tool_call")
+                    && l.contains("in_progress")
+            })
             .expect("added event data line");
-        assert!(added_line.contains("PATCH BODY"), "added item carries full input");
+        assert!(
+            added_line.contains("PATCH BODY"),
+            "added item carries full input"
+        );
     }
 
     #[test]
@@ -1679,7 +1903,7 @@ mod tests {
             "id": "toolu_1", "type": "function",
             "function": { "name": "shell", "arguments": "{\"command\":[\"ls\"]}" },
         })]);
-        let sse = build_responses_sse(&p, &kinds);
+        let sse = sse_of(&p, &kinds);
         assert!(sse.contains("event: response.function_call_arguments.delta"));
         assert!(sse.contains("event: response.function_call_arguments.done"));
         assert!(sse.contains("\"function_call\""));
@@ -1693,7 +1917,7 @@ mod tests {
         p.text = "hi".to_string();
         p.thinking = "deep thought".to_string();
         p.finish_reason = "stop".to_string();
-        let sse = build_responses_sse(&p, &kinds);
+        let sse = sse_of(&p, &kinds);
         assert!(sse.contains("event: response.reasoning_summary_text.delta"));
         assert!(sse.contains("deep thought"));
         assert!(sse.contains("\"reasoning\""));
@@ -1736,9 +1960,326 @@ mod tests {
         p.credit_usage = Some(0.99);
         p.credit_unit = Some("credit".to_string());
         p.credit_unit_plural = Some("credits".to_string());
-        let sse = build_responses_sse(&p, &kinds);
+        let sse = sse_of(&p, &kinds);
         assert!(sse.contains("\"credit_usage\":0.99"));
         assert!(sse.contains("\"credit_unit\":\"credit\""));
         assert!(sse.contains("\"credit_unit_plural\":\"credits\""));
+    }
+
+    // ---- previous_response_id：会话历史回放 ----
+
+    fn turn(instructions: Option<&str>, input: Value, output: Vec<Value>) -> HistoryTurn {
+        HistoryTurn {
+            instructions: instructions.map(str::to_string),
+            input: Some(input),
+            output,
+        }
+    }
+
+    fn assistant_text(text: &str) -> Value {
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text }],
+        })
+    }
+
+    /// 提取 messages 里每轮的 (role, 拼接文本)
+    fn role_texts(req: &MessagesRequest) -> Vec<(String, String)> {
+        req.messages
+            .iter()
+            .map(|m| {
+                let text = m
+                    .content
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                (m.role.clone(), text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn history_replays_prior_turns_before_current_input() {
+        let req = req_with(json!([]), json!("turn-2-user"));
+        let history = vec![turn(
+            None,
+            json!("turn-1-user"),
+            vec![assistant_text("turn-1-assistant")],
+        )];
+
+        let (anth, _) = responses_to_anthropic(req, &history).unwrap();
+        let got = role_texts(&anth);
+
+        assert_eq!(
+            got,
+            vec![
+                ("user".to_string(), "turn-1-user".to_string()),
+                ("assistant".to_string(), "turn-1-assistant".to_string()),
+                ("user".to_string(), "turn-2-user".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_replays_multiple_turns_oldest_first() {
+        let req = req_with(json!([]), json!("c-in"));
+        let history = vec![
+            turn(None, json!("a-in"), vec![assistant_text("a-out")]),
+            turn(None, json!("b-in"), vec![assistant_text("b-out")]),
+        ];
+
+        let (anth, _) = responses_to_anthropic(req, &history).unwrap();
+        let texts: Vec<String> = role_texts(&anth).into_iter().map(|(_, t)| t).collect();
+
+        assert_eq!(texts, vec!["a-in", "a-out", "b-in", "b-out", "c-in"]);
+    }
+
+    #[test]
+    fn history_instructions_become_system_before_current() {
+        let mut req = req_with(json!([]), json!("now"));
+        req.instructions = Some("current-sys".to_string());
+        let history = vec![turn(
+            Some("old-sys"),
+            json!("then"),
+            vec![assistant_text("reply")],
+        )];
+
+        let (anth, _) = responses_to_anthropic(req, &history).unwrap();
+        let sys = system_texts(&anth);
+
+        // 历史 instructions 先于本轮 instructions
+        let old = sys
+            .iter()
+            .position(|t| t == "old-sys")
+            .expect("缺少历史 system");
+        let cur = sys
+            .iter()
+            .position(|t| t == "current-sys")
+            .expect("缺少本轮 system");
+        assert!(old < cur);
+    }
+
+    #[test]
+    fn history_replays_tool_call_and_result_as_paired_blocks() {
+        // 历史里助手调了工具、客户端回了结果：回放后 tool_use / tool_result 必须配对，
+        // 否则 Kiro/Bedrock 会因为孤立的 tool_use 报错。
+        let req = req_with(json!([]), json!("thanks"));
+        let history = vec![HistoryTurn {
+            instructions: None,
+            input: Some(json!([
+                { "type": "message", "role": "user", "content": "list files" },
+            ])),
+            output: vec![json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Bash",
+                "arguments": "{\"command\":\"ls\"}",
+            })],
+        }];
+
+        let (anth, _) = responses_to_anthropic(req, &history).unwrap();
+        let blocks: Vec<&str> = anth
+            .messages
+            .iter()
+            .flat_map(|m| m.content.as_array().cloned().unwrap_or_default())
+            .filter_map(|b| b.get("type").and_then(|v| v.as_str()).map(str::to_string))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|s| match s.as_str() {
+                "text" => "text",
+                "tool_use" => "tool_use",
+                "tool_result" => "tool_result",
+                _ => "other",
+            })
+            .collect();
+
+        assert!(
+            blocks.contains(&"tool_use"),
+            "历史工具调用应回放为 tool_use"
+        );
+    }
+
+    #[test]
+    fn history_does_not_contribute_tool_declarations() {
+        // 历史里的 additional_tools 不该影响本轮的工具声明表
+        let req = req_with(json!([]), json!("hi"));
+        let history = vec![HistoryTurn {
+            instructions: None,
+            input: Some(json!([
+                { "type": "additional_tools", "tools": [
+                    { "type": "custom", "name": "old_tool" },
+                ]},
+                { "type": "message", "role": "user", "content": "before" },
+            ])),
+            output: vec![assistant_text("ok")],
+        }];
+
+        let (_, kinds) = responses_to_anthropic(req, &history).unwrap();
+        assert!(
+            !kinds.contains_key("old_tool"),
+            "历史工具声明不应进入本轮 ToolKindMap"
+        );
+    }
+
+    #[test]
+    fn empty_history_matches_single_turn_behavior() {
+        let req = req_with(json!([]), simple_input());
+        let (with_empty, _) = responses_to_anthropic(req, &[]).unwrap();
+
+        let req2 = req_with(json!([]), simple_input());
+        let (baseline, _) = convert(req2).unwrap();
+
+        assert_eq!(role_texts(&with_empty), role_texts(&baseline));
+    }
+
+    // ---- previous_response_id：链回溯 ----
+
+    fn chain_store() -> (ResponseStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-rs-resp-chain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (ResponseStore::new(&dir), dir)
+    }
+
+    fn stored(id: &str, prev: Option<&str>, text: &str) -> StoredResponse {
+        StoredResponse {
+            id: id.to_string(),
+            key_id: 1,
+            model: "gpt-5.6-sol".to_string(),
+            output: vec![assistant_text(text)],
+            previous_response_id: prev.map(str::to_string),
+            instructions: None,
+            input: Some(json!(format!("{text}-in"))),
+            stored_at: 0,
+        }
+    }
+
+    #[test]
+    fn load_history_chain_walks_ancestors_oldest_first() {
+        let (store, dir) = chain_store();
+        store.save(&stored("resp_a", None, "a"));
+        store.save(&stored("resp_b", Some("resp_a"), "b"));
+        store.save(&stored("resp_c", Some("resp_b"), "c"));
+
+        let chain = load_history_chain(&store, 1, "resp_c").unwrap();
+        let inputs: Vec<String> = chain
+            .iter()
+            .map(|t| t.input.as_ref().unwrap().as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(inputs, vec!["a-in", "b-in", "c-in"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_history_chain_errors_when_head_missing() {
+        let (store, dir) = chain_store();
+        let err = load_history_chain(&store, 1, "resp_nope").unwrap_err();
+        assert!(err.contains("resp_nope"), "错误信息应带上引用的 id: {err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_history_chain_rejects_other_tenants_id() {
+        let (store, dir) = chain_store();
+        store.save(&stored("resp_private", None, "secret"));
+
+        // key_id=2 引用 key_id=1 的 id：必须失败，不能泄露历史
+        assert!(load_history_chain(&store, 2, "resp_private").is_err());
+        assert!(load_history_chain(&store, 1, "resp_private").is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_history_chain_survives_broken_link() {
+        // 祖先已被清理：只回放能读到的后半段，不整轮失败
+        let (store, dir) = chain_store();
+        store.save(&stored("resp_b", Some("resp_gone"), "b"));
+
+        let chain = load_history_chain(&store, 1, "resp_b").unwrap();
+        assert_eq!(chain.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_history_chain_breaks_cycles() {
+        // 人为构造环：a -> b -> a，必须终止而不是无限回溯
+        let (store, dir) = chain_store();
+        store.save(&stored("resp_a", Some("resp_b"), "a"));
+        store.save(&stored("resp_b", Some("resp_a"), "b"));
+
+        let chain = load_history_chain(&store, 1, "resp_a").unwrap();
+        assert_eq!(chain.len(), 2, "环应在重复 id 处停止");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_history_chain_caps_depth() {
+        let (store, dir) = chain_store();
+        // 构造比上限更长的链
+        let total = MAX_HISTORY_DEPTH + 20;
+        for i in 0..total {
+            let id = format!("resp_{i}");
+            let prev = if i == 0 {
+                None
+            } else {
+                Some(format!("resp_{}", i - 1))
+            };
+            store.save(&stored(&id, prev.as_deref(), &format!("t{i}")));
+        }
+
+        let chain = load_history_chain(&store, 1, &format!("resp_{}", total - 1)).unwrap();
+        // 链头 + 最多 MAX_HISTORY_DEPTH 个祖先
+        assert!(
+            chain.len() <= MAX_HISTORY_DEPTH + 1,
+            "回溯深度未受限: {}",
+            chain.len()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- store / metadata 字段 ----
+
+    #[test]
+    fn store_defaults_to_true_and_respects_explicit_false() {
+        let default_req: ResponsesRequest =
+            serde_json::from_value(json!({ "model": "m", "input": "hi" })).unwrap();
+        assert!(default_req.should_store());
+
+        let off: ResponsesRequest =
+            serde_json::from_value(json!({ "model": "m", "input": "hi", "store": false })).unwrap();
+        assert!(!off.should_store());
+    }
+
+    #[test]
+    fn metadata_and_previous_response_id_deserialize() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "previous_response_id": "resp_prev",
+            "metadata": { "session": "abc" },
+        }))
+        .unwrap();
+
+        assert_eq!(req.previous_response_id.as_deref(), Some("resp_prev"));
+        assert_eq!(
+            req.metadata
+                .as_ref()
+                .and_then(|m| m.get("session"))
+                .map(String::as_str),
+            Some("abc")
+        );
     }
 }

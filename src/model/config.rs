@@ -182,6 +182,11 @@ pub struct Config {
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
 
+    /// `/v1/responses` 会话快照保留时长（秒，默认 2592000 = 30 天）。
+    /// 供 `previous_response_id` 续传；设为 0 表示关闭持久化。
+    #[serde(default = "default_responses_store_ttl_secs")]
+    pub responses_store_ttl_secs: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -281,6 +286,10 @@ fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
 
+fn default_responses_store_ttl_secs() -> u64 {
+    crate::anthropic::RESPONSES_DEFAULT_TTL_SECS
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -339,6 +348,7 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
+            responses_store_ttl_secs: default_responses_store_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
@@ -428,5 +438,21 @@ mod tests {
     fn model_cache_ttl_accepts_explicit_value() {
         let config: Config = serde_json::from_str(r#"{"modelCacheTtlSecs":120}"#).unwrap();
         assert_eq!(config.model_cache_ttl_secs, 120);
+    }
+
+    #[test]
+    fn responses_store_ttl_defaults_to_30_days() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.responses_store_ttl_secs, 30 * 24 * 60 * 60);
+        assert_eq!(
+            Config::default().responses_store_ttl_secs,
+            30 * 24 * 60 * 60
+        );
+    }
+
+    #[test]
+    fn responses_store_ttl_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"responsesStoreTtlSecs":0}"#).unwrap();
+        assert_eq!(config.responses_store_ttl_secs, 0);
     }
 }

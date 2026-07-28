@@ -50,6 +50,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// Responses 会话快照存储（`previous_response_id` 支持，可选）
+    pub response_store: Option<Arc<crate::anthropic::response_store::ResponseStore>>,
 }
 
 impl AppState {
@@ -68,6 +70,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            response_store: None,
         }
     }
 
@@ -99,6 +102,15 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入 Responses 会话快照存储
+    pub fn with_response_store(
+        mut self,
+        store: Option<Arc<crate::anthropic::response_store::ResponseStore>>,
+    ) -> Self {
+        self.response_store = store;
         self
     }
 }

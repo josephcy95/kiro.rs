@@ -262,6 +262,21 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // Responses 会话快照（previous_response_id 续传）。持久化到
+    // cache_dir/responses/<key_id>/<id>.json；TTL 设为 0 表示关闭该能力。
+    let response_store = if config.responses_store_ttl_secs > 0 {
+        let store = std::sync::Arc::new(
+            anthropic::ResponseStore::new(cache_dir.join("responses"))
+                .with_ttl(config.responses_store_ttl_secs),
+        );
+        store.purge_expired();
+        store.clone().spawn_background();
+        Some(store)
+    } else {
+        tracing::info!("responses_store_ttl_secs = 0，/v1/responses 会话续传已关闭");
+        None
+    };
+
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -271,6 +286,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        response_store,
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

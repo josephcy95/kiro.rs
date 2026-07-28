@@ -254,7 +254,7 @@ curl http://127.0.0.1:8990/v1/chat/completions \
 
 ### OpenAI Responses / Codex CLI
 
-`POST /v1/responses` 接受字符串或 input item 数组形式的 `input`，并支持 `instructions`、`reasoning.effort`、`max_output_tokens` 和非流式 / SSE 响应：
+`POST /v1/responses` 接受字符串或 input item 数组形式的 `input`，并支持 `instructions`、`reasoning.effort`、`max_output_tokens`、`previous_response_id`、`store`、`metadata` 和非流式 / SSE 响应：
 
 ```bash
 curl http://127.0.0.1:8990/v1/responses \
@@ -290,6 +290,33 @@ codex
 ```
 
 两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。当前实现会先取得完整的内部非流式响应，再为 `stream: true` 合成 SSE，因此不是逐 token 的上游实时流。Responses 端点不会把 Codex 的 `exec`、`shell`、`apply_patch` 等本地执行工具声明转发给 Kiro；时效性查询由服务端的 Kiro MCP WebSearch 处理。
+
+#### 会话续传（previous_response_id）
+
+客户端可以只发本轮输入、用 `previous_response_id` 引用上一轮，由服务端补齐历史：
+
+```bash
+# 第一轮：记下返回的 id
+curl -sS http://127.0.0.1:8990/v1/responses ... -d '{
+  "model": "gpt-5.6-sol", "input": "My name is Ada."
+}'   # -> { "id": "resp_abc...", ... }
+
+# 第二轮：只发新输入
+curl -sS http://127.0.0.1:8990/v1/responses ... -d '{
+  "model": "gpt-5.6-sol",
+  "input": "What is my name?",
+  "previous_response_id": "resp_abc..."
+}'
+```
+
+行为说明：
+
+- **落盘**：每轮的 `input`、`instructions` 与 `output` 快照写入 `<配置目录>/responses/<客户端 Key id>/<response id>.json`。请求带 `"store": false` 时不落盘（该轮无法被后续引用）。
+- **回放**：沿 `previous_response_id` 链回溯到最早一轮，按 oldest → newest 展开成历史消息。历史中的 `function_call` 与 `function_call_output` 成对回放，工具调用上下文因此得以保留。
+- **隔离**：快照按客户端 Key 分目录，且读取时校验归属。其它 Key 即便拿到 response id 也读不到内容。
+- **TTL**：默认保留 30 天（`responsesStoreTtlSecs`），过期条目在读取时和每日后台任务中清理。设为 `0` 则完全关闭该能力，此时带 `previous_response_id` 的请求返回 400。
+- **健壮性**：回溯深度上限 64 轮并带环检测。若某个祖先已过期被清理，只回放仍可读的后半段，不会让整轮请求失败；仅当直接引用的 id 本身读不到时才报 400。
+- **注意**：历史以明文 JSON 存放在配置目录，与 `credentials.json` 同级别敏感，请确保该目录权限得当。
 
 <a id="api-routes"></a>
 ## API 路由
@@ -374,6 +401,7 @@ Admin API 鉴权同样支持：
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
+| `responsesStoreTtlSecs` | `2592000` | `/v1/responses` 会话快照保留秒数（30 天）；`0` 关闭会话续传 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |

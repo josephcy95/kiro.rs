@@ -27,6 +27,7 @@ mod converter;
 mod handlers;
 mod middleware;
 mod openai;
+mod response_store;
 mod responses;
 mod router;
 pub mod stream;
@@ -40,3 +41,5 @@ mod websearch_loop;
 pub use router::create_router_with_provider;
 #[allow(unused_imports)]
 pub use router::{create_router, create_router_with_shared_provider};
+
+pub use response_store::{DEFAULT_TTL_SECS as RESPONSES_DEFAULT_TTL_SECS, ResponseStore};

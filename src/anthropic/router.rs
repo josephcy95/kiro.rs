@@ -20,6 +20,7 @@ use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
+    response_store::ResponseStore,
     responses::post_responses,
 };
 
@@ -44,6 +45,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -58,6 +60,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    response_store: Option<Arc<ResponseStore>>,
 ) -> Router {
     create_router_with_shared_provider(
         kiro_provider.map(Arc::new),
@@ -68,6 +71,7 @@ pub fn create_router(
         usage_aggregator,
         cache_meter,
         trace_store,
+        response_store,
     )
 }
 
@@ -82,6 +86,7 @@ pub fn create_router_with_shared_provider(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    response_store: Option<Arc<ResponseStore>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -90,6 +95,7 @@ pub fn create_router_with_shared_provider(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_response_store(response_store);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
