@@ -134,6 +134,8 @@ pub mod outcome {
     pub const SUCCESS: &str = "success";
     pub const QUOTA_EXHAUSTED: &str = "quota_exhausted";
     pub const ACCOUNT_THROTTLED: &str = "account_throttled";
+    /// 403 + 明确封禁文案：账号被上游封禁/停用，禁用凭据且不参与自愈
+    pub const ACCOUNT_SUSPENDED: &str = "account_suspended";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const TRANSIENT: &str = "transient";
     pub const NETWORK_ERROR: &str = "network_error";

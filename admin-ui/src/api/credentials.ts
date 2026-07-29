@@ -448,6 +448,39 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+// 自愈治理配置。suspendedDetectionEnabled/enabled/minIntervalSecs/maxConsecutiveRounds
+// 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
+export interface SelfHealConfig {
+  suspendedDetectionEnabled: boolean
+  enabled: boolean
+  minIntervalSecs: number
+  maxConsecutiveRounds: number
+  consecutiveRounds: number
+  totalCount: number
+}
+
+// 可写字段（PUT 时提交的子集）
+export type SelfHealConfigPatch = Partial<
+  Pick<
+    SelfHealConfig,
+    'suspendedDetectionEnabled' | 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'
+  >
+>
+
+// 获取自愈治理配置
+export async function getSelfHealConfig(): Promise<SelfHealConfig> {
+  const { data } = await api.get<SelfHealConfig>('/config/self-heal')
+  return data
+}
+
+// 更新自愈治理配置
+export async function setSelfHealConfig(
+  patch: SelfHealConfigPatch,
+): Promise<SelfHealConfig> {
+  const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

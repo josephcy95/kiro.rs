@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Boxes,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -19,9 +19,10 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useSelfHealConfig, useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey } from '@/api/credentials'
+import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
@@ -258,6 +259,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
+      <SelfHealConfigButton />
       <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
@@ -305,6 +307,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
+        <SelfHealCompactItems />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
@@ -655,6 +658,197 @@ function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
         onCustomMinChange={setCustomMin}
         onSubmitCustom={submitCustom}
       />
+    </>
+  )
+}
+
+// ============ 自愈治理 ============
+
+const SELF_HEAL_INTERVAL_PRESETS = [
+  { label: '不冷却', secs: 0 },
+  { label: '1 分钟', secs: 60 },
+  { label: '5 分钟', secs: 5 * 60 },
+  { label: '15 分钟', secs: 15 * 60 },
+  { label: '30 分钟', secs: 30 * 60 },
+]
+
+/**
+ * 自愈治理设置（下拉）：
+ * - 开关：是否启用凭据自愈
+ * - 冷却间隔：两次自愈的最小间隔（打断持续 403 死循环的关键）
+ * - 连续上限：连续自愈达到该轮数且期间无成功则停止（0=不限）
+ * - 只读观测：凭据最大连续轮数 / 累计恢复凭据次数
+ */
+function SelfHealConfigButton() {
+  const { data: config, isLoading } = useSelfHealConfig()
+  const { mutate, isPending } = useSetSelfHealConfig()
+  const [open, setOpen] = useState(false)
+  const [roundsInput, setRoundsInput] = useState('')
+
+  useEffect(() => {
+    if (!open) setRoundsInput('')
+  }, [open])
+
+  const enabled = config?.enabled ?? true
+  const busy = isLoading || isPending
+
+  const save = (patch: SelfHealConfigPatch, msg: string) => {
+    mutate(patch, {
+      onSuccess: () => toast.success(msg),
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const submitRounds = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(roundsInput, 10)
+    if (Number.isNaN(n) || n < 0 || n > 1000) {
+      toast.error('请输入 0-1000 之间的轮数（0=不限）')
+      return
+    }
+    save({ maxConsecutiveRounds: n }, n === 0 ? '连续自愈已设为不限' : `连续自愈上限已设为 ${n} 轮`)
+    setRoundsInput('')
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy}
+          title={enabled ? '凭据自愈：已启用' : '凭据自愈：已关闭'}
+        >
+          {enabled ? (
+            <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
+          ) : (
+            <HeartCrack className="h-3.5 w-3.5 text-amber-500" />
+          )}
+          <span className="hidden md:inline">
+            {isLoading ? '自愈…' : enabled ? '自愈开' : '自愈关'}
+          </span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-72">
+        <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium">{enabled ? '已启用' : '已关闭'}</div>
+              <div className="text-muted-foreground">
+                当前请求池全灭时按作用域恢复凭据
+              </div>
+            </div>
+            <Switch
+              checked={enabled}
+              disabled={busy}
+              onCheckedChange={(v) => save({ enabled: v }, v ? '已开启凭据自愈' : '已关闭凭据自愈')}
+            />
+          </div>
+          {config && (
+            <div className="mt-2 flex items-center justify-between rounded-md bg-secondary/20 px-2.5 py-1.5 text-xs text-muted-foreground">
+              <span>连续 {config.consecutiveRounds} 轮</span>
+              <span>累计恢复 {config.totalCount} 次</span>
+            </div>
+          )}
+        </div>
+
+        <DropdownMenuLabel className="pt-1">403 封禁识别</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium">
+                {config?.suspendedDetectionEnabled ?? true ? '已启用' : '已关闭'}
+              </div>
+              <div className="text-muted-foreground">
+                命中封禁文案的 403 立即禁用，不参与自愈
+              </div>
+            </div>
+            <Switch
+              checked={config?.suspendedDetectionEnabled ?? true}
+              disabled={busy}
+              onCheckedChange={(v) =>
+                save({ suspendedDetectionEnabled: v }, v ? '已开启 403 封禁识别' : '已关闭 403 封禁识别')
+              }
+            />
+          </div>
+        </div>
+
+        <DropdownMenuLabel className="pt-1">自愈冷却间隔</DropdownMenuLabel>
+        <div className={cooldownPanelClassName(enabled)}>
+          <div className="grid grid-cols-3 gap-1.5">
+            {SELF_HEAL_INTERVAL_PRESETS.map((p) => (
+              <Button
+                key={p.secs}
+                size="sm"
+                variant={config?.minIntervalSecs === p.secs ? 'default' : 'outline'}
+                className="h-7 text-xs"
+                disabled={busy || !enabled}
+                onClick={() => save({ minIntervalSecs: p.secs }, `自愈冷却已设为「${p.label}」`)}
+              >
+                {p.label}
+              </Button>
+            ))}
+          </div>
+
+          <DropdownMenuLabel className="px-0 pt-2">连续自愈上限（0=不限）</DropdownMenuLabel>
+          <form onSubmit={submitRounds} className="mt-1 flex items-center gap-1.5">
+            <Input
+              type="number"
+              min={0}
+              max={1000}
+              placeholder={`当前 ${config?.maxConsecutiveRounds ?? 5} 轮`}
+              value={roundsInput}
+              onChange={(e) => setRoundsInput(e.target.value)}
+              disabled={busy || !enabled}
+              className="h-7 text-xs"
+            />
+            <span className="text-xs text-muted-foreground">轮</span>
+            <Button
+              type="submit"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={busy || !enabled || !roundsInput.trim()}
+            >
+              保存
+            </Button>
+          </form>
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/** 紧凑模式（下拉菜单内）的自愈开关项 */
+function SelfHealCompactItems() {
+  const { data: config, isLoading } = useSelfHealConfig()
+  const { mutate, isPending } = useSetSelfHealConfig()
+  const enabled = config?.enabled ?? true
+  const busy = isLoading || isPending
+
+  return (
+    <>
+      <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
+      <DropdownMenuItem
+        disabled={busy}
+        onSelect={() =>
+          mutate(
+            { enabled: !enabled },
+            {
+              onSuccess: () => toast.success(!enabled ? '已开启凭据自愈' : '已关闭凭据自愈'),
+              onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+            },
+          )
+        }
+      >
+        {enabled ? <HeartPulse /> : <HeartCrack />}
+        {isLoading
+          ? '自愈加载中'
+          : enabled
+            ? `关闭自愈（连续 ${config?.consecutiveRounds ?? 0} 轮）`
+            : '开启全账号自愈'}
+      </DropdownMenuItem>
     </>
   )
 }

@@ -238,15 +238,20 @@ impl TraceSink for RequestTracer {
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
 fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
-    Some(match last.as_str() {
+    Some(canonical_attempt_outcome(&last))
+}
+
+fn canonical_attempt_outcome(value: &str) -> &'static str {
+    match value {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
         outcome::ACCOUNT_THROTTLED => outcome::ACCOUNT_THROTTLED,
+        outcome::ACCOUNT_SUSPENDED => outcome::ACCOUNT_SUSPENDED,
         outcome::AUTH_FAILED => outcome::AUTH_FAILED,
         outcome::TRANSIENT => outcome::TRANSIENT,
         outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,
         outcome::BAD_REQUEST => outcome::BAD_REQUEST,
         _ => outcome::UNKNOWN,
-    })
+    }
 }
 
 /// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
@@ -1856,6 +1861,14 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_suspended_attempt_is_preserved_as_request_error_type() {
+        assert_eq!(
+            canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
+            outcome::ACCOUNT_SUSPENDED
+        );
+    }
 
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {

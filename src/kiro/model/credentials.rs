@@ -129,6 +129,26 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因。与 `disabled` 一起持久化，避免重启后把自动禁用误判为手动禁用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
+    /// 当前凭据连续执行自愈的轮数。成功调用后清零。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub self_heal_consecutive_rounds: u32,
+
+    /// 当前凭据累计被自愈恢复的次数，仅用于观测。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_heal_total_count: u64,
+
+    /// 最近一次自愈时间（RFC3339）。用于让冷却窗口跨进程重启生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_self_heal_at: Option<String>,
+
+    /// 触发当前连续自愈轮次的模型。`None` 表示 MCP/无模型请求。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_heal_model: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -160,6 +180,10 @@ pub struct KiroCredentials {
 
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -200,6 +224,14 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
+            .field(
+                "self_heal_consecutive_rounds",
+                &self.self_heal_consecutive_rounds,
+            )
+            .field("self_heal_total_count", &self.self_heal_total_count)
+            .field("last_self_heal_at", &self.last_self_heal_at)
+            .field("self_heal_model", &self.self_heal_model)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
@@ -270,8 +302,8 @@ pub const ALLOWED_EXTERNAL_IDP_SUFFIXES: &[&str] = &[
 /// 要求：可解析、必须 https、host 非 IP 字面量、host 命中 [`ALLOWED_EXTERNAL_IDP_SUFFIXES`]。
 /// 用于 Token 刷新（外发 refreshToken 前）与导入校验两处，防 SSRF / 凭据外泄。
 pub fn validate_external_idp_endpoint(raw_url: &str) -> Result<(), String> {
-    let url = reqwest::Url::parse(raw_url.trim())
-        .map_err(|e| format!("IdP 端点 URL 无法解析: {}", e))?;
+    let url =
+        reqwest::Url::parse(raw_url.trim()).map_err(|e| format!("IdP 端点 URL 无法解析: {}", e))?;
 
     if !url.scheme().eq_ignore_ascii_case("https") {
         return Err("IdP 端点 URL 必须为 https".to_string());
@@ -613,6 +645,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -625,6 +662,31 @@ mod tests {
         assert!(!json.contains("refreshToken"));
         // priority 为 0 时不序列化
         assert!(!json.contains("priority"));
+    }
+
+    #[test]
+    fn test_self_heal_runtime_state_roundtrip() {
+        let credentials = KiroCredentials {
+            disabled: true,
+            disabled_reason: Some("TooManyFailures".to_string()),
+            self_heal_consecutive_rounds: 3,
+            self_heal_total_count: 8,
+            last_self_heal_at: Some("2026-07-29T00:00:00Z".to_string()),
+            self_heal_model: Some("claude-sonnet-4.8".to_string()),
+            ..KiroCredentials::default()
+        };
+
+        let json = credentials.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+        assert!(parsed.disabled);
+        assert_eq!(parsed.disabled_reason.as_deref(), Some("TooManyFailures"));
+        assert_eq!(parsed.self_heal_consecutive_rounds, 3);
+        assert_eq!(parsed.self_heal_total_count, 8);
+        assert_eq!(
+            parsed.last_self_heal_at.as_deref(),
+            Some("2026-07-29T00:00:00Z")
+        );
+        assert_eq!(parsed.self_heal_model.as_deref(), Some("claude-sonnet-4.8"));
     }
 
     #[test]
@@ -807,6 +869,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -845,6 +912,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -966,6 +1038,11 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1266,7 +1343,10 @@ mod tests {
     #[test]
     fn test_normalize_import_auth_method_inference() {
         // 显式别名 → external_idp
-        assert_eq!(normalize_import_auth_method("azuread", None), "external_idp");
+        assert_eq!(
+            normalize_import_auth_method("azuread", None),
+            "external_idp"
+        );
         // 带 tokenEndpoint 但未声明（默认 social）→ 推断 external_idp
         assert_eq!(
             normalize_import_auth_method(
@@ -1276,7 +1356,10 @@ mod tests {
             "external_idp"
         );
         // 空 tokenEndpoint 不触发推断
-        assert_eq!(normalize_import_auth_method("social", Some("   ")), "social");
+        assert_eq!(
+            normalize_import_auth_method("social", Some("   ")),
+            "social"
+        );
         assert_eq!(normalize_import_auth_method("social", None), "social");
         // idc 保持
         assert_eq!(normalize_import_auth_method("idc", None), "idc");
@@ -1339,7 +1422,10 @@ mod tests {
             cred.token_endpoint.as_deref(),
             Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
         );
-        assert_eq!(cred.scopes.as_deref(), Some("openid profile offline_access"));
+        assert_eq!(
+            cred.scopes.as_deref(),
+            Some("openid profile offline_access")
+        );
 
         // 序列化后应保留新字段（camelCase）
         let serialized = cred.to_pretty_json().unwrap();

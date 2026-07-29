@@ -480,6 +480,42 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 自愈治理配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfHealConfigResponse {
+    /// 是否识别 403 封禁文案并立即禁用凭据
+    pub suspended_detection_enabled: bool,
+    /// 是否启用全账号自愈
+    pub enabled: bool,
+    /// 两次自愈的最小冷却间隔（秒）
+    pub min_interval_secs: u64,
+    /// 连续自愈最大轮数（0=不限）
+    pub max_consecutive_rounds: u32,
+    /// 所有凭据中的最大连续自愈轮数（只读观测，同一凭据成功后清零）
+    pub consecutive_rounds: u32,
+    /// 累计恢复凭据次数（只读观测，只增）
+    pub total_count: u64,
+}
+
+/// 更新自愈治理配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelfHealConfigRequest {
+    /// 是否识别 403 封禁文案；缺省表示不修改
+    #[serde(default)]
+    pub suspended_detection_enabled: Option<bool>,
+    /// 是否启用自愈；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 自愈冷却间隔（秒）；缺省不修改，0..=86400
+    #[serde(default)]
+    pub min_interval_secs: Option<u64>,
+    /// 连续自愈上限；缺省不修改，0..=1000（0=不限）
+    #[serde(default)]
+    pub max_consecutive_rounds: Option<u32>,
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

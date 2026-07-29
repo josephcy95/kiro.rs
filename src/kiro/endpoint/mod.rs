@@ -88,6 +88,14 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_gateway_timeout(&self, body: &str) -> bool {
         default_is_gateway_timeout(body)
     }
+
+    /// 判断响应体是否表示"账号被封禁/停用"（403 + 明确封禁文案）。
+    ///
+    /// 与普通 403（权限/WAF/区域抖动）区分：账号封禁是不可自动恢复的终态，
+    /// 需人工联系客服核实。识别后立即禁用该凭据且**不参与自愈**，避免死循环。
+    fn is_account_suspended(&self, body: &str) -> bool {
+        default_is_account_suspended(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -154,6 +162,20 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity")
         && body.contains("temporary limits")
+}
+
+/// 默认的"账号被封禁/停用"判断逻辑
+///
+/// 上游对被封账号返回 403 + 类似：
+/// `Your User ID (...) temporarily is suspended. We've locked your account as a
+/// security precaution. To restore access, please contact our support team ...`
+///
+/// 与普通 403（权限不足 / WAF / 区域抖动）的关键差异：同时出现 "suspended" 与
+/// "locked your account" 两个高特异短语。大小写不敏感匹配，兼容文案微调。
+/// 两个短语都命中才判定，避免把偶发 403 误判为封禁。
+pub fn default_is_account_suspended(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("suspended") && lower.contains("locked your account")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -258,6 +280,27 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
+    }
+
+    #[test]
+    fn test_default_is_account_suspended() {
+        let body = r#"{"message":"Your User ID (736048611274) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/","reason":null}"#;
+        assert!(default_is_account_suspended(body));
+
+        // 大小写不敏感
+        assert!(default_is_account_suspended(
+            "Account SUSPENDED. We've LOCKED YOUR ACCOUNT."
+        ));
+
+        // 普通 403 权限错误不应命中
+        assert!(!default_is_account_suspended(
+            r#"{"message":"User is not authorized to perform this action","reason":null}"#
+        ));
+        // 仅命中一个短语时不判定为封禁
+        assert!(!default_is_account_suspended("your account is suspended"));
+        assert!(!default_is_account_suspended(
+            "we have locked your account temporarily"
+        ));
     }
 
     #[test]

@@ -4,6 +4,53 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.4] - 2026-07-28
+
+主题：**修复 IdC / Enterprise 重新登录后 Token 无法刷新，以及持续 403 场景下“全账号自愈”陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题**。本版合并 [PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52) 与 [issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51) 的修复：重新登录会整体替换与 OIDC 客户端绑定的凭据；账号池则精准识别 403 封禁，并通过配置驱动的**节流 + 连续上限 + 可观测**治理自愈行为。新增配置字段均 `serde(default)`，旧 `config.json` 无需改动。
+
+### 🔧 修复 — IdC / Enterprise 重新登录凭据失配
+
+> 来源：[PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52)。提交人：[@Xm798](https://github.com/Xm798)，感谢贡献。
+
+- **整体替换 OIDC 客户端绑定凭据**：IdC refresh token 与注册时生成的 `clientId` / `clientSecret` 绑定；重新登录不再只写入新 refresh token，而是同步替换 access token、refresh token、客户端注册、区域、Start URL 与 provider，避免下一次刷新因“新 token + 旧客户端”组合返回 `invalid_grant`。
+- **清理已失效或跨认证方式的字段**：重新登录后清除属于旧身份的 `profileArn`，使其在后续请求中重新解析；同时移除 `tokenEndpoint` / `issuerUrl` / `scopes` / `kiroApiKey` 等非 IdC 残留字段，并保留邮箱、API 区域、分组等与本次客户端注册无关的账号配置。
+- **Enterprise 不再静默降级**：重新登录请求未显式提供 Start URL 或区域时继承原凭据配置，不会把 Enterprise 账号按 Builder ID 默认端点重新注册。
+- **失败不再伪装成成功**：上游未返回 refresh token 时显式报错；失效 refresh token 归类为 HTTP 400，管理端可提示重新登录，而不是返回 500 或在未更新凭据时报告成功。
+- **收紧并发窗口**：强制刷新先取得凭据刷新锁再读取快照，避免与重新登录并发时继续使用旧凭据；完成内存替换后先释放全局刷新锁再持久化，防止文件写入阻塞其它账号刷新。
+- **合并后的健康状态一致**：重新登录会重置失败、禁用、自愈连续轮数、冷却时间与模型状态，但保留累计自愈次数；与本版新增的每凭据自愈状态可以共同工作。
+
+### 🐛 问题背景
+
+当所有凭据均因连续失败被自动禁用时，系统会执行"自愈"——重置失败计数并重新启用（等价于重启）。旧实现**无冷却、无上限**：持续 403 会形成 `全禁 → 自愈(重置) → 403 → 累计 3 次 → 全禁 → 自愈` 的紧密死循环，表现为自愈日志刷屏、持续无效打上游、面板状态抖动。其中一类高频根因是**账号被上游封禁**（响应体形如 `Your User ID (...) temporarily is suspended. We've locked your account ...`）——这类凭据不可能自愈恢复，重置只是徒劳地推迟下一次失败。
+
+### 🔒 修复方案一：403 账号封禁识别
+
+- 新增端点级 `is_account_suspended`：仅当 403 响应体**同时**命中 `suspended` 与 `locked your account` 两个高特异短语（大小写不敏感）时判定为封禁。只针对这类明确文案，**不影响**普通 403（权限/WAF/区域抖动），避免误伤瞬态 403。
+- 命中后立即标记凭据为 `Suspended` 并禁用、切换到下一个可用凭据，**不累计、不参与自愈**；需人工联系客服核实后经 Admin API / 面板手动重置（误判逃生途径）。
+- 新增配置项 **`suspendedDetectionEnabled`（默认 `true`）** 作为总开关；trace 新增 `account_suspended` 分类；管理面板凭据卡片新增「账号封禁」徽标。
+
+### 🔧 修复方案二：自愈治理（配置入手）
+
+对齐既有账号级风控配置的运行时可改 + 持久化模式，新增 3 个 `selfHeal*` 配置项，并将恢复状态从全局状态重构为每凭据状态：
+
+- **`selfHealEnabled`（默认 `true`）**：凭据自愈总开关。关闭后当前请求池全灭即直接失败。
+- **`selfHealMinIntervalSecs`（默认 `300`）**：同一凭据两次自愈的最小冷却间隔，将持续故障下的探测频率限制为每 5 分钟一次。
+- **`selfHealMaxConsecutiveRounds`（默认 `5`，`0`=不限）**：同一凭据、同一模型连续自愈达到上限后停止；其它凭据、分组或模型的成功不会重置该计数。
+- 自愈只恢复当前 `model/group` 作用域内可路由的凭据；不存在的分组、不支持的模型和纯 429 冷却不会修改无关凭据。
+- `disabledReason`、连续轮数、累计恢复次数和最近恢复时间随凭据原子落盘，重启不会重新启用 `Suspended` 账号或绕过连续上限。
+- 所有运行时 `config.json` 部分更新经共享锁串行化，避免并发 PUT 丢字段。
+
+### 📊 可观测性
+
+- 自愈日志记录请求 model/group、恢复凭据 ID 和数量，达上限时按凭据输出人工介入提示。
+- 新增 Admin API `GET|PUT /api/admin/config/self-heal`，读写全部 4 个开关（含 `suspendedDetectionEnabled`）并返回只读观测值 `consecutiveRounds` / `totalCount`。
+- 管理面板顶栏新增「凭据自愈」设置项，并展示最大连续轮数与累计恢复凭据次数。
+
+### 🔒 兼容性
+
+- 封禁识别只匹配 `suspended` + `locked your account` 两个高特异短语同时出现的情形，普通 403 仍走既有累计路径，不误伤瞬态 403。
+- 全部新增字段 `serde(default)`，缺省即默认值；如需完全回退旧行为，可将 `suspendedDetectionEnabled` 设为 `false`、`selfHealMinIntervalSecs` 与 `selfHealMaxConsecutiveRounds` 均设为 `0`。
+
 ## [0.7.3] - 2026-07-28
 
 主题：**以 Kiro 上游实际返回的模型目录替代本地静态列表，新增按凭据缓存、分组聚合和模型感知路由，并开放未知合法模型 ID 的直接透传**。本次兼容性补丁同时扩展了 Admin 模型面板：可按账号池策略查询模型、查看输入/输出 Token 上限，并发送真实的最小化请求验证模型。已有 `customModels`、`-thinking` 请求方式和静态上下文估算继续兼容。
